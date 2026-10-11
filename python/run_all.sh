@@ -6,8 +6,8 @@
 # and can be re-run; finished model/seed combinations are skipped.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
-DATA=../data/CombinedALLGeo.csv
-GLOBAL=../data/YouTubeCombinedGeo.csv
+DATA=../data/dataset1.csv
+GLOBAL=../data/dataset2.csv
 SEEDS="0 1 2 3 4"
 
 echo "---- 1. prepare data"
