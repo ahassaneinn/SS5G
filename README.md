@@ -5,7 +5,7 @@ Code for predicting which edge server serves a 5G user next and for evaluating t
 | Version | Content |
 |---|---|
 | v1.0 | Code of the ICMEW 2025 study (offline comparison of DL models) |
-| v2.0 | This release: rebuilt pipeline, methods from the literature, and the ns-3 evaluation |
+| v2.0 | This release: rebuilt pipeline, baselines, and the ns-3 evaluation |
 
 ## Repository layout
 
@@ -19,8 +19,7 @@ ns3/       allocation and load-balancing rule, ns-3 simulator, run and analysis 
 
 **Prediction (`python/`).** For every user and active second, the models predict the serving server of the *next* second (the server that carries the most bytes) from the previous 60 active seconds. The pipeline includes:
 
-- seven DL models: DNN, LSTM, GRU, Transformer, Autoformer, TFT and FEDformer (`eua_pipeline.py`);
-- four methods from the literature, adapted to the same task: DeepCog, Dong, DeepSlice and Chen (`sota_models.py`);
+- seven DL models: DNN, LSTM, GRU, Transformer, Autoformer, TFT and FEDformer (`eua_pipeline.py`, function `build_model`);
 - four non-learning baselines: persistence, per-user majority, per-application majority and nearest server.
 
 All models use the same inputs, a per-user chronological 70/15/15 split with a purge gap, and the same training protocol and seeds. Training-set statistics are used for normalization.
