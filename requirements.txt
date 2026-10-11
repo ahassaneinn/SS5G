@@ -1,0 +1,7 @@
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+tensorflow>=2.10
+keras-tuner  # only for the optional `tune` step
