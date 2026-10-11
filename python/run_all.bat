@@ -9,8 +9,8 @@ REM  Every stage writes to results\ (results_global\ for the international
 REM  portion) and can be re-run; finished model/seed combinations are skipped.
 REM ==========================================================================
 setlocal
-set DATA=..\data\CombinedALLGeo.csv
-set GLOBAL=..\data\YouTubeCombinedGeo.csv
+set DATA=..\data\dataset1.csv
+set GLOBAL=..\data\dataset2.csv
 set SEEDS=0 1 2 3 4
 
 echo ---- 1. prepare data (about 30 s)
@@ -37,7 +37,7 @@ python eua_pipeline.py train --work work --out results --models DNN GRU Transfor
 echo ---- 6. unseen users: 5 user-disjoint folds
 python eua_pipeline.py holdout --work work --out results --models GRU DNN || goto :err
 
-echo ---- 7. international portion (14 YouTube users)
+echo ---- 7. international portion
 python eua_pipeline.py train --work work_global --out results_global --models all --feature-sets full --seeds 0 1 2 || goto :err
 
 echo ---- 8. inference latency: GPU, then CPU only
