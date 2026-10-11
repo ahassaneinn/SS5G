@@ -4,13 +4,13 @@ REM  Full Python pipeline (Windows). Run from a prompt with your TensorFlow
 REM  environment activated, inside this python folder:
 REM       conda activate <your-tf-env>
 REM       run_all.bat
-REM  Put the two GAViST5G CSV files in ..\data first (see ..\data\README.md).
+REM  Put the two dataset CSV files in ..\data first (see ..\data\README.md).
 REM  Every stage writes to results\ (results_global\ for the international
 REM  portion) and can be re-run; finished model/seed combinations are skipped.
 REM ==========================================================================
 setlocal
-set DATA=..\data\CombinedALLGeo.csv
-set GLOBAL=..\data\YouTubeCombinedGeo.csv
+set DATA=..dataset1.csv
+set GLOBAL=..dataset2.csv
 set SEEDS=0 1 2 3 4
 
 echo ---- 1. prepare data (about 30 s)
