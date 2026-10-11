@@ -61,9 +61,17 @@ Individual steps can also be run on their own (`python eua_pipeline.py <command>
 
 ## Citation
 
-If you use this code, please cite the dataset:
+If you use this code, please cite the study that introduced the models and the dataset:
 
 ```bibtex
+@inproceedings{HassaneinICMEW2025,
+  author    = {Hassanein, Ahmed and Hashemi, Mahmoud Reza and Shirmohammadi, Shervin},
+  title     = {{AI}-Assisted Edge Server Selection in {5G} for Low-Latency Multimedia Applications},
+  booktitle = {2025 IEEE International Conference on Multimedia and Expo Workshops (ICMEW)},
+  year      = {2025},
+  url       = {https://ieeexplore.ieee.org/document/11152098}
+}
+
 @article{HassaneinGAViST5G2025,
   author  = {Hassanein, Ahmed and Hashemi, Mahmoud Reza and Shirmohammadi, Shervin},
   title   = {Descriptor: Gaming and Video Streaming Traffic for {5G} Dataset ({GAViST5G})},
@@ -75,4 +83,4 @@ If you use this code, please cite the dataset:
 }
 ```
 
-and the corresponding article (citation to be added on publication).
+The citation of the journal article for v2.0 will be added on publication.
