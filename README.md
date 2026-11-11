@@ -5,7 +5,7 @@ Code for predicting which edge server serves a 5G user next and for evaluating t
 | Version | Content |
 |---|---|
 | v1.0 | Code of the ICMEW 2025 study (offline comparison of DL models) |
-| v2.0 | Rebuilt pipeline, baselines, and the ns-3 evaluation (first revision of the journal article) |
+| v2.0 | Rebuilt pipeline, baselines, and the ns-3 evaluation |
 | v3.0 | This release: equal-budget hyperparameter tuning with the selected values, repeated simulation runs for every allocator, residual-aware load balancing, and measured server load and reassignment metrics |
 
 ## Repository layout
@@ -13,7 +13,7 @@ Code for predicting which edge server serves a 5G user next and for evaluating t
 ```
 data/                  where to put the GAViST5G CSV files (not included)
 python/                preprocessing, models, tuning, training, baselines, metrics, latency, reports
-python/tuning/         selected hyperparameters and all 15 trials of every model (the values in the paper)
+python/tuning/         selected hyperparameters and all 15 trials of every model
 python/architectures/  layers, output shapes, parameters and hyperparameters of every model, written from the code
 ns3/                   allocation and load-balancing rules, ns-3 simulator, run, analysis and table/figure scripts
 ```
@@ -77,5 +77,3 @@ If you use this code, please cite the study that introduced the models and the d
   doi     = {10.1109/IEEEDATA.2025.3572868}
 }
 ```
-
-The citation of the journal article will be added on publication.
