@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-allocate.py -- ns-3 stage 2 (called by run_ns3.sh; Python 3 standard library only).
+allocate.py -- JCC revision, ns-3 stage 2 (called by run_ns3.sh; Python 3 standard library only).
 
 Turns one decision set (ranked candidate servers from a model or a baseline) into the
 flow schedule that eua_trace_sim.cc replays, applying an explicit, documented
-allocation policy.
+allocation policy (Reviewer 1 #12, Reviewer 2 #5).
 
 Control loop (epoch = 1 s, the granularity of the trace)
   For every active user-second (u,t), in increasing t, users in ascending id order:
@@ -17,12 +17,23 @@ Control loop (epoch = 1 s, the granularity of the trace)
                    + the K nearest servers of the SAME provider (AS/organisation) as the top-1,
                else (no spare capacity anywhere) the least-loaded server in [top-1] + A
                (ties -> earlier in the list, i.e. the model's choice is kept).
+               This is the "next-closest server" rule of the submitted paper, made explicit.
   lbk        as lb but A = [previous server] + model candidates 2..5 + K nearest same-provider
                servers ("model-ranked load balancing").
   leastload  load balancing only, no prediction: candidates = K nearest servers of the provider
                the user is currently using; first with spare capacity, else least loaded.
   The rule never splits a user-second across servers; reassignment happens at epoch boundaries
   (the old connection is left to drain, a new one is opened to the new server).
+
+Residual traffic (revision 2, Reviewer 1)
+  L_s(t) is reset at every epoch, but traffic admitted earlier may still be queued or draining.
+  The orchestrator keeps a causal fluid estimate of that residual traffic from the bytes it
+  actually assigned in past epochs (observable after each epoch):
+      R_s(t) = max(0, R_s(t-1) + A_s(t-1) - C * 1 s),   drained by C per idle second
+  lb / lbk / leastload       ignore R_s (the rule of the submitted paper; R_s is only logged)
+  lbres / leastloadres       capacity check  L_s + R_s + d_u <= C  (residual-aware variants)
+  --checks writes every capacity check (t, server, L_s, d_u, R_s, passed); eua_trace_sim_r2
+  compares it with the residual it measures in ns-3 (false admissions).
 
 Outputs
   --out    flows CSV:  uid,app,t,server,delay_ms,dir,proto,bytes
@@ -56,7 +67,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--inputs", default="ns3_inputs")
     ap.add_argument("--decisions", required=True, help="e.g. GRU__s0")
-    ap.add_argument("--policy", default="direct", choices=["direct", "lb", "lbk", "leastload"])
+    ap.add_argument("--policy", default="direct",
+                    choices=["direct", "lb", "lbk", "leastload", "lbres", "leastloadres"])
     ap.add_argument("--cap", type=float, default=0.0, help="per-server capacity in Mbps (0 = unlimited)")
     ap.add_argument("--scenario", default="real", choices=["real", "aligned"],
                     help="real: trace time of day; aligned: every user's test period starts at t=0 (high contention)")
@@ -71,8 +83,12 @@ def main():
     ap.add_argument("--user-subset", type=int, default=0, help="smoke test: N users, stratified by app")
     ap.add_argument("--out", required=True)
     ap.add_argument("--stats", required=True)
+    ap.add_argument("--checks", default=None, help="write every capacity check to this CSV (for ns-3)")
     a = ap.parse_args()
     C = a.cap * 1e6 if a.cap > 0 else math.inf
+    use_res = a.policy in ("lbres", "leastloadres")
+    lb_like = a.policy in ("lb", "lbk", "lbres")
+    ll_like = a.policy in ("leastload", "leastloadres")
 
     # ---------------- load inputs
     srv = {}
@@ -164,10 +180,30 @@ def main():
     n = n_override = n_acc = n_pref_acc = 0
     true_load = defaultdict(float)  # (t_sim, server) -> actual bps
     users_on = defaultdict(list)    # (t_sim, server) -> uids
-    assign_seq = defaultdict(list)  # uid -> [(t_sim, server, label)]
+    assign_seq = defaultdict(list)  # uid -> [(t_sim, server, label, pref)]
+    resid = defaultdict(float)      # fluid estimate of residual traffic per server (bits)
+    epoch_bits = defaultdict(float) # bits actually assigned per server in the current epoch
+    res_at_assign = []              # R_s / C of the chosen server (finite C only)
+    checks = []                     # (t, server, L, d, R, passed)
+    Cbits = C * 1.0                 # capacity of one 1-s epoch (bits)
+
+    def advance(t_new):
+        """close the current epoch and drain the residual estimate up to epoch t_new"""
+        if cur_t is None or C == math.inf:
+            return
+        gap = t_new - cur_t
+        for s_ in set(resid) | set(epoch_bits):
+            r = max(0.0, resid[s_] + epoch_bits[s_] - Cbits)
+            r = max(0.0, r - Cbits * (gap - 1))
+            if r > 0:
+                resid[s_] = r
+            else:
+                resid.pop(s_, None)
+        epoch_bits.clear()
 
     for t_sim, uid, key in events:
         if t_sim != cur_t:
+            advance(t_sim)
             load.clear()
             cur_t = t_sim
         app, label, last, est = steps[key]
@@ -177,12 +213,19 @@ def main():
         prv = prev_srv.get(uid)
         prv_s = prv[1] if prv else None
 
-        def fits(s):
-            return load[s] + d <= C
+        def fits(s_):
+            r = resid.get(s_, 0.0)
+            ok = load[s_] + d + (r if use_res else 0.0) <= C
+            if C < math.inf:
+                checks.append((t_sim, s_, load[s_], d, r, int(ok)))
+            return ok
 
-        if a.policy == "direct" or (a.policy in ("lb", "lbk") and fits(pref)):
+        def lkey(x, order):
+            return (load[x] + d + (resid.get(x, 0.0) if use_res else 0.0), order.index(x))
+
+        if a.policy == "direct" or (lb_like and fits(pref)):
             s = pref
-        elif a.policy in ("lb", "lbk"):
+        elif lb_like:
             alts = []
             if prv_s and prv_s != pref and srv[prv_s][2] == srv[pref][2]:
                 alts.append(prv_s)
@@ -196,12 +239,12 @@ def main():
                     order.append(x)
             s = next((x for x in order[1:] if fits(x)), None)
             if s is None:
-                s = min(order, key=lambda x: (load[x] + d, order.index(x)))
-        else:  # leastload: provider of the current server, nearest first, no prediction
+                s = min(order, key=lambda x: lkey(x, order))
+        else:  # leastload(res): provider of the current server, nearest first, no prediction
             order = nearest_same_org(last)
             s = next((x for x in order if fits(x)), None)
             if s is None:
-                s = min(order, key=lambda x: (load[x] + d, order.index(x)))
+                s = min(order, key=lambda x: lkey(x, order))
 
         load[s] += d
         prev_srv[uid] = (t_sim, s)
@@ -209,7 +252,9 @@ def main():
         n_override += (s != pref)
         n_acc += (s == label)
         n_pref_acc += (pref == label)
-        assign_seq[uid].append((t_sim, s, label))
+        assign_seq[uid].append((t_sim, s, label, pref))
+        if C < math.inf:
+            res_at_assign.append(resid.get(s, 0.0) / Cbits)
         dl = srv_delay_ms(s)
         tot = 0
         for (dr, proto, b) in traffic.get(key, []):
@@ -218,7 +263,16 @@ def main():
             rows.append((uid, app, t_sim, s, round(dl, 3), dr, proto, b))
             tot += b
         true_load[(t_sim, s)] += tot * 8.0
+        epoch_bits[s] += tot * 8.0
         users_on[(t_sim, s)].append(uid)
+
+    if a.checks is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(a.checks)), exist_ok=True)
+        with open(a.checks, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["t", "server", "load_bps", "d_bps", "resid_bits", "passed"])
+            for c in checks:
+                w.writerow([c[0], c[1], round(c[2]), round(c[3]), round(c[4]), c[5]])
 
     # merge rows with the same key (UDP->TCP mapping can create duplicates)
     agg = defaultdict(int)
@@ -237,8 +291,16 @@ def main():
 
     # ---------------- allocation-level statistics (true bytes)
     sw = sw_obs = pairs = 0
+    ra_all = ra_model = ra_lb = pairs_all = 0
     for uid, seq in assign_seq.items():
-        for (t0, s0, l0), (t1, s1, l1) in zip(seq, seq[1:]):
+        for (t0, s0, l0, p0), (t1, s1, l1, p1) in zip(seq, seq[1:]):
+            pairs_all += 1                       # consecutive active seconds of the user
+            if s1 != s0:
+                ra_all += 1
+                if s1 == p1:
+                    ra_model += 1                # the model's own choice moved the user
+                else:
+                    ra_lb += 1                   # the move was caused by the LB override
             if t1 - t0 <= 300:
                 pairs += 1
                 sw += (s1 != s0)
@@ -256,6 +318,13 @@ def main():
         if C < math.inf:
             utils.append(bps / C)
     imb = [max(v) / (sum(v) / len(v)) for v in per_sec.values() if len(v) >= 2 and sum(v) > 0]
+
+    def pvar(v):
+        m = sum(v) / len(v)
+        return sum((x - m) ** 2 for x in v) / len(v)
+    # planned (offered) load variance across the servers in use, Var_s(L_s/C) per epoch
+    lv = [pvar([x / C for x in v]) for v in per_sec.values()] if C < math.inf else []
+    lv2 = [pvar([x / C for x in v]) for v in per_sec.values() if len(v) >= 2] if C < math.inf else []
     srv_at = defaultdict(list)
     for (t, s) in true_load:
         srv_at[t].append(s)
@@ -274,6 +343,13 @@ def main():
         "density": a.density, "n_user_seconds": n, "n_users": len(assign_seq),
         "pref_acc": n_pref_acc / n, "assign_acc": n_acc / n, "lb_override_rate": n_override / n,
         "switch_rate": sw / max(pairs, 1), "observed_switch_rate": sw_obs / max(pairs, 1),
+        "reassign_rate": ra_all / max(pairs_all, 1),
+        "reassign_rate_model": ra_model / max(pairs_all, 1),
+        "reassign_rate_lb": ra_lb / max(pairs_all, 1),
+        "load_var_util": (sum(lv) / len(lv)) if lv else float("nan"),
+        "load_var_util_2plus": (sum(lv2) / len(lv2)) if lv2 else float("nan"),
+        "resid_est_at_assign_mean_epochs": (sum(res_at_assign) / len(res_at_assign)) if res_at_assign else float("nan"),
+        "n_capacity_checks": len(checks),
         "n_servers_used": len(per_srv),
         "overload_user_seconds_frac": over_us / n,
         "overload_bytes_frac": over_b / max(tot_b, 1),

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 r"""
-analyze_ns3.py -- ns-3 stage 4: aggregate all runs into tables and figures.
+analyze_ns3.py -- JCC revision, ns-3 stage 4: aggregate all runs into tables and figures.
 
-  python3 analyze_ns3.py --results results_ns3 [--latency-cpu ../python/results/latency_CPU.csv]
+  python3 analyze_ns3.py --results results_ns3 [--latency-cpu ../../Python\ Code/Revision/results/latency_CPU.csv]
 
 Every number is reported as mean +- sd and a 95% t-confidence interval over runs
 (DL models: 5 training seeds x RUNS_DL ns-3 replications; baselines: RUNS_BASE replications).
@@ -24,8 +24,7 @@ import pandas as pd
 from scipy import stats
 
 ORDER = ["Observed", "Persistence", "UserMajority", "AppMajority", "NearestServer", "LBOnly",
-         "DNN", "LSTM", "GRU", "Transformer", "Autoformer", "TFT", "FEDformer",
-         "DeepCog", "Dong", "DeepSlice", "Chen"]
+         "DNN", "LSTM", "GRU", "Transformer", "Autoformer", "TFT", "FEDformer"]
 LABEL = {"Observed": "Observed (historical)", "LBOnly": "LB only (no prediction)",
          "NearestServer": "Nearest server", "UserMajority": "Per-user majority",
          "AppMajority": "Per-app majority"}
@@ -179,7 +178,7 @@ def tables(s, al, outdir):
                 tex += ["\\bottomrule", "\\end{tabular}"]
                 fn = f"table_{scen}_d{dens}_{pol}_cap{cap:g}.tex"
                 open(os.path.join(outdir, fn), "w").write("\n".join(tex))
-        # per-application QoS: video stall proxy, gaming delay/jitter/loss
+        # per-application QoS (R2 #6): video stall proxy, gaming delay/jitter/loss
         for cap in sorted(gs.cap.unique(), reverse=True, key=lambda c: (c == 0, c)):
             v = gs[(gs.policy.isin(["direct", "lb"])) & (gs.cap == cap) & (gs.group == "VIDEO") & (gs.dir == "DL")]
             gm = gs[(gs.policy.isin(["direct", "lb"])) & (gs.cap == cap) & (gs.group == "GAMING") & (gs.dir == "ALL")]

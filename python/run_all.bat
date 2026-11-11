@@ -1,62 +1,67 @@
 @echo off
-REM ==========================================================================
-REM  Full Python pipeline (Windows). Run from a prompt with your TensorFlow
-REM  environment activated, inside this python folder:
-REM       conda activate <your-tf-env>
-REM       run_all.bat
-REM  Put the two GAViST5G CSV files in ..\data first (see ..\data\README.md).
-REM  Every stage writes to results\ (results_global\ for the international
-REM  portion) and can be re-run; finished model/seed combinations are skipped.
-REM ==========================================================================
-setlocal
-set DATA=..\data\dataset1.csv
-set GLOBAL=..\data\dataset2.csv
+REM SS5G v3.0 -- whole Python pipeline (Windows). Open a prompt with your TensorFlow environment
+REM active and run this file from the python folder. Put the two GAViST5G CSV files in ..\data first.
+REM Every step can be re-run; finished tuning runs, models and seeds are skipped.
+REM   set USE_RELEASED_TUNING=1 before running to skip the Bayesian optimisation and use the
+REM   selected values in tuning\ (the values reported in the paper).
+cd /d "%~dp0"
+set DATA=..\data\CombinedALLGeo.csv
+set GLOBAL=..\data\YouTubeCombinedGeo.csv
 set SEEDS=0 1 2 3 4
 
-echo ---- 1. prepare data (about 30 s)
-python eua_pipeline.py prepare --data "%DATA%" --work work || goto :err
-python eua_pipeline.py prepare --data "%GLOBAL%" --single-app YouTube --work work_global || goto :err
+echo ---- 1. prepare data
+python eua_pipeline.py prepare --data %DATA% --work work || goto :fail
+python eua_pipeline.py prepare --data %GLOBAL% --single-app YouTube --work work_global || goto :fail
 
-echo ---- 2. smoke test: every model, 1 epoch, 6 users (a few minutes)
-python eua_pipeline.py smoke --work work --out results || goto :err
+echo ---- 2. smoke tests
+python eua_pipeline.py smoke --work work --out results || goto :fail
+python sota_models.py smoke --work work --out results || goto :fail
 
-echo ---- 3. baselines (seconds)
-python eua_pipeline.py baselines --work work --out results || goto :err
-python eua_pipeline.py baselines --work work_global --out results_global || goto :err
+echo ---- 3. baselines
+python eua_pipeline.py baselines --work work --out results || goto :fail
+python eua_pipeline.py baselines --work work_global --out results_global || goto :fail
 
-REM Optional: equal-budget Bayesian optimisation (several hours). Then add
-REM --use-tuned to the train and latency commands below.
-REM python eua_pipeline.py tune --work work --out results --models all --trials 15
+echo ---- 4. hyperparameter tuning (15 trials per model)
+if "%USE_RELEASED_TUNING%"=="1" (
+  if not exist results\tuning mkdir results\tuning
+  copy /Y tuning\*.json results\tuning\ >nul
+) else (
+  python eua_pipeline.py tune --work work --out results --trials 15 || goto :fail
+  python sota_models.py tune --work work --out results --trials 15 || goto :fail
+)
 
-echo ---- 4. seven DL models x 5 seeds
-python eua_pipeline.py train --work work --out results --models all --feature-sets full --seeds %SEEDS% || goto :err
+echo ---- 5. training with the selected values: 11 models x 5 seeds
+python eua_pipeline.py train --work work --out results --use-tuned --feature-sets full --seeds %SEEDS% || goto :fail
+python sota_models.py train --work work --out results --use-tuned --feature-sets full --seeds %SEEDS% || goto :fail
 
-echo ---- 5. feature ablation: no RTT, no server history
-python eua_pipeline.py train --work work --out results --models DNN GRU Transformer FEDformer --feature-sets no_rtt no_srv --seeds %SEEDS% || goto :err
+echo ---- 6. inputs of the ns-3 evaluation (..\ns3\ns3_inputs)
+python ..\ns3\make_ns3_inputs.py --work work --results results --out ..\ns3\ns3_inputs || goto :fail
 
-echo ---- 6. unseen users: 5 user-disjoint folds
-python eua_pipeline.py holdout --work work --out results --models GRU DNN || goto :err
+echo ---- 7. architecture tables
+python eua_pipeline.py describe --work work --out results --use-tuned || goto :fail
+python sota_models.py describe --work work --out results --use-tuned || goto :fail
 
-echo ---- 7. international portion
-python eua_pipeline.py train --work work_global --out results_global --models all --feature-sets full --seeds 0 1 2 || goto :err
+echo ---- 8. feature ablation, unseen users, international portion
+python eua_pipeline.py train --work work --out results --use-tuned --models DNN GRU Transformer FEDformer --feature-sets no_rtt no_srv --seeds %SEEDS% || goto :fail
+python eua_pipeline.py holdout --work work --out results --use-tuned --models GRU DNN || goto :fail
+python eua_pipeline.py train --work work_global --out results_global --use-tuned --tuning-dir results\tuning --models all --feature-sets full --seeds 0 1 2 || goto :fail
 
-echo ---- 8. inference latency: GPU, then CPU only
-python eua_pipeline.py latency --work work --out results || goto :err
+echo ---- 9. inference latency: GPU, then CPU only
+python eua_pipeline.py latency --work work --out results --use-tuned || goto :fail
+python sota_models.py latency --work work --out results --use-tuned || goto :fail
 set CUDA_VISIBLE_DEVICES=-1
-python eua_pipeline.py latency --work work --out results || goto :err
+python eua_pipeline.py latency --work work --out results --use-tuned || goto :fail
+python sota_models.py latency --work work --out results --use-tuned || goto :fail
 set CUDA_VISIBLE_DEVICES=
 
-echo ---- 9. reports
-python eua_pipeline.py report --out results
-python eua_pipeline.py report --out results_global
+echo ---- 10. reports
+python eua_pipeline.py report --out results || goto :fail
+python eua_pipeline.py report --out results_global || goto :fail
 
-echo ---- 10. inputs of the ns-3 evaluation (..\ns3\ns3_inputs)
-python ..\ns3\make_ns3_inputs.py --python-dir . --out ..\ns3\ns3_inputs || goto :err
-
-echo DONE. Open results\REPORT.md
-goto :eof
-
-:err
-echo.
-echo *** A step failed; see the error above. ***
+echo DONE. Open results\REPORT.md; the ns-3 inputs are in ..\ns3\ns3_inputs
+pause
+exit /b 0
+:fail
+echo A step failed; see the messages above.
+pause
 exit /b 1

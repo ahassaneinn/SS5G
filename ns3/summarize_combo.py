@@ -22,7 +22,13 @@ METRICS = ["goodput_mbps", "delivery_ratio", "loss_pct", "delay_mean_ms", "delay
            "delay_p95_ms", "delay_p99_ms", "jitter_mean_ms", "share_delay_le_50ms",
            "share_delay_le_100ms", "stall_frac", "lag_mean_s", "flow_thr_mbps"]
 ALLOC = ["pref_acc", "assign_acc", "lb_override_rate", "switch_rate", "n_servers_used",
-         "overload_user_seconds_frac", "util_p95", "jain_server_bytes"]
+         "overload_user_seconds_frac", "util_p95", "jain_server_bytes", "reassign_rate",
+         "reassign_rate_model", "reassign_rate_lb", "load_var_util", "resid_est_at_assign_mean_epochs"]
+# server-level metrics measured in ns-3 (results_ns3/<scen>/srv/<tag>__run<r>.csv, revision 2)
+SRV = ["load_var_util", "load_var_util_2plus", "util_mean", "util_p95", "jain_server_bytes",
+       "overloaded_server_epoch_frac", "overloaded_user_seconds_frac", "dropped_MB", "resid_mean_epochs",
+       "resid_p95_epochs", "resid_gt1_share", "false_admission_rate", "false_admissions", "n_checks_passed",
+       "resid_est_abs_err_epochs", "reassign_rate", "reassign_draining_share", "drain_MB_mean"]
 TAG = re.compile(r"(?P<scenario>[a-z]+)__d(?P<density>\d+)__(?P<model>[A-Za-z]+)__s(?P<mseed>\d+)"
                  r"__(?P<policy>[a-z]+)__cap(?P<cap>[0-9.]+)(__run(?P<run>\d+))?$")
 # two-sided 95% t critical values, df = 1..30 (1.96 beyond)
@@ -71,7 +77,7 @@ def expected_runs(results, scenario, model):
             for line in open(f):
                 p = line.split()
                 if len(p) >= 7 and p[2] == model:
-                    tot += int(p[6])
+                    tot += len(p[6].split(","))
     return tot if found else None
 
 
@@ -113,6 +119,31 @@ def summarize(results, scenario, model, quiet=False):
                     groups[key][k].append(fnum(r.get(k)))
     os.replace(base + "_runs.csv.tmp", base + "_runs.csv")
 
+    # ---- server-level runs (measured load variance, residual traffic, reassignments)
+    srvg = defaultdict(lambda: defaultdict(list))
+    with open(base + "_srv_runs.csv.tmp", "w", newline="") as out:
+        w = None
+        for f, m in sorted(files, key=lambda x: x[0]):
+            sf = os.path.join(results, scen, "srv", os.path.basename(f))
+            if not os.path.exists(sf):
+                continue
+            try:
+                rows = list(csv.DictReader(open(sf)))
+            except Exception:
+                continue
+            for r in rows:
+                r2 = {"model": model, "scenario": scenario, "density": m.group("density"),
+                      "mseed": m.group("mseed"), "policy": m.group("policy"), "cap": m.group("cap")}
+                r2.update(r)
+                if w is None:
+                    w = csv.DictWriter(out, fieldnames=list(r2.keys()))
+                    w.writeheader()
+                w.writerow({k: r2.get(k, "") for k in w.fieldnames})
+                key = (int(m.group("density")), m.group("policy"), float(m.group("cap")))
+                for k in SRV:
+                    srvg[key][k].append(fnum(r.get(k)))
+    os.replace(base + "_srv_runs.csv.tmp", base + "_srv_runs.csv")
+
     # ---- summary csv
     order = lambda k: (k[0], k[1], k[2] != 0, -k[2], k[3], k[4])
     with open(base + "_summary.csv.tmp", "w", newline="") as out:
@@ -153,7 +184,7 @@ def summarize(results, scenario, model, quiet=False):
     md = [f"# {model} — scenario `{scenario}`", "",
           f"Updated {time.strftime('%Y-%m-%d %H:%M:%S')} — finished runs: **{n_done}**"
           + (f" of {exp} ({100 * n_done / exp:.0f} %)" if exp else ""), "",
-          "Mean ± 95 % CI over runs (5 training seeds × ns-3 replications).", ""]
+          "Mean ± 95 % CI over runs (training seed s paired with network seed s+1; baselines: network seeds 1..R).", ""]
     cols = [("goodput_mbps", "Goodput (Mbps)", 2), ("delivery_ratio", "Delivered", 3),
             ("delay_mean_ms", "Delay mean (ms)", 1), ("delay_p95_ms", "Delay p95 (ms)", 1),
             ("delay_p99_ms", "Delay p99 (ms)", 1), ("jitter_mean_ms", "Jitter (ms)", 2),
@@ -193,6 +224,20 @@ def summarize(results, scenario, model, quiet=False):
             md.append(f"| x{k[0]} | {k[1]} | {capname(k[2])} | {f3(a['pref_acc'])} | {f3(a['assign_acc'])} | "
                       f"{f3(a['lb_override_rate'])} | {f3(a['switch_rate'])} | {f3(a['n_servers_used'], 0)} | "
                       f"{f3(a['overload_user_seconds_frac'])} | {f3(a['util_p95'], 2)} | {f3(a['jain_server_bytes'])} |")
+        md.append("")
+    if srvg:
+        md.extend(["## Server-level metrics measured in ns-3 (mean over runs)", "",
+                   "| density | policy | capacity | runs | Var util | util p95 | overloaded srv-epochs | "
+                   "overloaded user-s | residual (epochs) | residual > 1 epoch | false admissions | "
+                   "reassign rate | reassign w/ draining |", "|---|---|---|---|---|---|---|---|---|---|---|---|---|"])
+        for k in sorted(srvg, key=lambda k: (k[0], k[1], k[2] != 0, -k[2])):
+            a = {c: stats(srvg[k][c]) for c in SRV}
+            f3 = lambda v, d=3: "--" if v is None else f"{v:.{d}f}"
+            md.append(f"| x{k[0]} | {k[1]} | {capname(k[2])} | {a['util_mean'][3]} | {f3(a['load_var_util'][0], 4)} | "
+                      f"{f3(a['util_p95'][0], 2)} | {f3(a['overloaded_server_epoch_frac'][0])} | "
+                      f"{f3(a['overloaded_user_seconds_frac'][0])} | {f3(a['resid_mean_epochs'][0], 2)} | "
+                      f"{f3(a['resid_gt1_share'][0])} | {f3(a['false_admission_rate'][0])} | "
+                      f"{f3(a['reassign_rate'][0])} | {f3(a['reassign_draining_share'][0])} |")
         md.append("")
     open(base + "_summary.md", "w").write("\n".join(md) + "\n")
     if not quiet:

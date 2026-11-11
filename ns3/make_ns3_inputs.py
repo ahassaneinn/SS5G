@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-make_ns3_inputs.py -- ns-3 stage 1: build ns3_inputs/ from the outputs of ../python (run once).
+make_ns3_inputs.py -- JCC revision, ns-3 stage 1 (revision 2: --work / --results may point to different folders).
 
 Builds the inputs of the trace-driven ns-3 evaluation from the outputs of eua_pipeline.py:
   work/ns3_records.csv.gz   every trace record, oriented user<->server, real timestamps
@@ -8,10 +8,10 @@ Builds the inputs of the trace-driven ns-3 evaluation from the outputs of eua_pi
   work/servers.csv          server IP, lat, lon, organisation
   results/predictions/      pred_<Model>_<fs>_seed<k>.csv.gz (TEST period only, top-5 ranked servers)
 
-Design
-  * every allocator replays the SAME traffic (test-period user-seconds of all users)
-  * real per-second timing of the trace
-  * only TEST-period decisions are simulated
+What it fixes w.r.t. the submitted ns-3 study
+  N1  every allocator replays the SAME traffic (test-period user-seconds of all 83 users)
+  N4  real per-second timing of the trace (no synthetic, evenly spaced start times)
+  --  only TEST-period decisions are simulated (old study used predictions on training windows)
 
 Outputs (ns3_inputs/):
   steps.csv.gz      User,t,app,label,last,est_bps     one row per decision (test user-second)
@@ -30,13 +30,14 @@ GAMING = {"LOL", "TFT", "VAL"}
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--python-dir", dest="python_dir", default=os.path.join("..", "python"),
-                    help="folder of eua_pipeline.py with work/ and results/ (default ../python)")
+    ap.add_argument("--revision", default=None, help="path to a Python folder with work/ and results/")
+    ap.add_argument("--work", default=None, help="prepared data folder (overrides <revision>/work)")
+    ap.add_argument("--results", default=None, help="results folder with predictions/ (overrides <revision>/results)")
     ap.add_argument("--out", default="ns3_inputs")
     ap.add_argument("--fs", default="full", help="feature set of the DL predictions to use")
     a = ap.parse_args()
-    work = os.path.join(a.python_dir, "work")
-    pdir = os.path.join(a.python_dir, "results", "predictions")
+    work = a.work or os.path.join(a.revision, "work")
+    pdir = os.path.join(a.results or os.path.join(a.revision, "results"), "predictions")
     os.makedirs(os.path.join(a.out, "decisions"), exist_ok=True)
 
     steps = pd.read_csv(os.path.join(work, "steps.csv.gz"))
@@ -96,7 +97,7 @@ def main():
         return lst
 
     made = []
-    # historical assignment (Observed)
+    # historical assignment ("Original data" in the submitted paper)
     write_dec("Observed", 0, [[s] for s in out_steps.label]); made.append("Observed__s0")
     # persistence from the RAW current server (the pred file holds UNK for servers unseen in training)
     write_dec("Persistence", 0, [[s] for s in out_steps["last"]]); made.append("Persistence__s0")

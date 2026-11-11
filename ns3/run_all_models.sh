@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# run_all_models.sh -- ONE command for the whole ns-3 study.
+# run_all_models.sh -- ONE command for the whole ns-3 study (JCC revision 2).
 #
-#   NS3_DIR=~/ns-3-dev ./run_all_models.sh            # run everything (resumable)
-#   ./run_all_models.sh status                         # progress table (any time, from another terminal)
+#   GROUP=baselines ./run_all_models.sh                 # phase 1: reference allocators (no DL needed)
+#   GROUP=learned   ./run_all_models.sh                 # phase 2: the 11 learned models
+#   ./run_all_models.sh status                          # progress table (any time, from another terminal)
 #
-# Order: scenario by scenario (main -> aligned -> density); inside each scenario the 11 DL models
-# one after another (DNN, LSTM, GRU, Transformer, Autoformer, TFT, FEDformer, DeepCog, Dong,
-# DeepSlice, Chen), then the reference allocators (Observed, Persistence, LBOnly, UserMajority,
-# AppMajority, NearestServer).  Each model/scenario combination runs all its seeds,
-# capacities, policies and replications in parallel, then writes its own files:
+# Order: scenario by scenario (SCENARIOS, default main -> aligned -> density); inside each scenario
+# one allocator after another.  Design: see run_ns3.sh (RUNS network seeds shared by every
+# allocator; training seed s <-> network seed s+1; GRU crossed; residual-aware LB as sensitivity).
+# Each model/scenario combination runs all its seeds, capacities, policies and runs in parallel,
+# then writes its own files:
 #
 #   results_ns3/by_model/<scenario>/<Model>_summary.md    readable tables (open while running)
 #   results_ns3/by_model/<scenario>/<Model>_summary.csv   mean / sd / 95% CI per policy x capacity
@@ -19,14 +20,15 @@
 # finished runs.
 #
 # environment (all optional):
-#   NS3_DIR     ns-3 tree with scratch/eua_trace_sim.cc built   (default ~/ns-3-dev)
+#   NS3_DIR     ns-3 tree with scratch/eua_trace_sim_r2.cc built (default ~/ns-3-dev)
 #   JOBS        parallel simulations                           (default: cores - 1)
-#   RUNS_DL     replications per DL model seed                 (default 4 -> 20 runs per model)
-#   RUNS_BASE   replications per deterministic baseline        (default 20)
+#   GROUP       all | baselines | learned                      (default all)
 #   SCENARIOS   default "main aligned density"
-#   MODELS      default "DNN LSTM GRU Transformer Autoformer TFT FEDformer DeepCog Dong DeepSlice Chen"
+#   MODELS      learned models, default "GRU LSTM DNN Transformer Autoformer TFT FEDformer DeepCog
+#               Dong DeepSlice Chen"
 #   REFERENCE   reference allocators; default "Observed Persistence LBOnly UserMajority AppMajority
-#               NearestServer"  (REFERENCE="" -> only the DL models)
+#               NearestServer"
+#   RUNS, SEEDS, CROSSED, RES_MODELS, DENSITY_LEARNED: passed to run_ns3.sh
 #   REFRESH     seconds between live summary refreshes        (default 300)
 #   EXTRA       extra flags for eua_trace_sim (e.g. "--qdisc=codel")
 set -uo pipefail
@@ -34,8 +36,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 RES="$HERE/results_ns3"
 SCENARIOS="${SCENARIOS:-main aligned density}"
-MODELS_ALL="${MODELS:-DNN LSTM GRU Transformer Autoformer TFT FEDformer DeepCog Dong DeepSlice Chen}"
+MODELS_ALL="${MODELS:-GRU LSTM DNN Transformer Autoformer TFT FEDformer DeepCog Dong DeepSlice Chen}"
 REFERENCE="${REFERENCE-Observed Persistence LBOnly UserMajority AppMajority NearestServer}"
+case "${GROUP:-all}" in
+  baselines) MODELS_ALL="" ;;
+  learned)   REFERENCE="" ;;
+esac
+export GROUP="all"   # the per-model calls below select allocators with MODELS
 REFRESH="${REFRESH:-300}"
 export NS3_DIR="${NS3_DIR:-$HOME/ns-3-dev}"
 mkdir -p "$RES"
@@ -62,12 +69,12 @@ PY
 if [[ "${1:-}" == "status" ]]; then status; exit 0; fi
 
 # ------------------------------------------------------------------ checks
-if ! find "$NS3_DIR/build" -type f -name '*eua_trace_sim*' -perm -u+x 2>/dev/null | grep -q .; then
-  echo "eua_trace_sim is not built in $NS3_DIR. Do this first:"
-  echo "   cp eua_trace_sim.cc $NS3_DIR/scratch/ && cd $NS3_DIR && ./ns3 build scratch/eua_trace_sim"
+if ! find "$NS3_DIR/build" -type f -name '*eua_trace_sim_r2*' -perm -u+x 2>/dev/null | grep -q .; then
+  echo "eua_trace_sim_r2 is not built in $NS3_DIR. Do this first:"
+  echo "   cp eua_trace_sim_r2.cc $NS3_DIR/scratch/ && cd $NS3_DIR && ./ns3 build scratch/eua_trace_sim_r2"
   exit 1
 fi
-[[ -x "$HERE/run_ns3.sh" ]] || chmod +x "$HERE/run_ns3.sh"
+chmod +x "$HERE"/*.sh 2>/dev/null || true
 
 say() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
 
@@ -75,7 +82,7 @@ say() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
 TOTAL=0
 for s in $SCENARIOS; do
   for m in $MODELS_ALL $REFERENCE; do
-    n=$(MODELS="$m" "$HERE/run_ns3.sh" list 2>/dev/null | awk -v p="$s:" '$1==p {print $(NF-2)}')
+    n=$(MODELS="$m" bash "$HERE/run_ns3.sh" list 2>/dev/null | awk -v p="$s:" '$1==p {print $(NF-2)}')
     TOTAL=$(( TOTAL + ${n:-0} ))
   done
 done
@@ -89,13 +96,18 @@ trap 'cleanup; say "INTERRUPTED -- run the same command again to resume"; exit 1
 T_ALL=$(date +%s)
 for s in $SCENARIOS; do
   for m in $MODELS_ALL $REFERENCE; do
+    if [[ " $REFERENCE " != *" $m "* ]] && \
+       ! ls "$HERE/ns3_inputs/decisions/${m}__s0.csv.gz" >/dev/null 2>&1; then
+      say "SKIP   $s / $m: no decision files in ns3_inputs/decisions (run make_ns3_inputs.py first)"
+      continue
+    fi
     T0=$(date +%s)
     say "BEGIN  $s / $m"
     # live refresh of this combination's summary while it runs
     ( while sleep "$REFRESH"; do python3 "$HERE/summarize_combo.py" --results "$RES" --scenario "$s" \
         --model "$m" --quiet 2>/dev/null; done ) &
     REFRESHER=$!
-    MODELS="$m" "$HERE/run_ns3.sh" "$s" >> "$RES/run_ns3_${s}_${m}.log" 2>&1
+    MODELS="$m" bash "$HERE/run_ns3.sh" "$s" >> "$RES/run_ns3_${s}_${m}.log" 2>&1
     rc=$?
     kill "$REFRESHER" 2>/dev/null; wait "$REFRESHER" 2>/dev/null; REFRESHER=""
     python3 "$HERE/summarize_combo.py" --results "$RES" --scenario "$s" --model "$m" | tee -a "$LOG"

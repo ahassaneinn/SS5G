@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 """
-eua_pipeline.py — deep learning-based edge user allocation (EUA) on the GAViST5G dataset.
+eua_pipeline.py — rebuilt, leakage-free edge-user-allocation (EUA) pipeline
+for the JCC major revision (round 2: equal-budget tuning of every model, `describe`,
+paired accuracy differences vs. persistence).
 
-Task definition:
+Task definition (fixes reviewer points R1.3-R1.8, R2.3, R3.1):
   * Granularity: per user, per active second. The "serving server" of a second
     is the server endpoint that carried the most bytes for that user in that
     second (both directions summed).
@@ -14,7 +16,7 @@ Task definition:
   * Split: chronological per user (70/15/15 by default) with a purge of W
     samples at each boundary so no test window overlaps a training window.
     Scaler and vocabularies are fit on the training period only.
-  * Second protocol: unseen users (5 user-disjoint folds, `holdout`).
+  * Second protocol: unseen users (5 user-disjoint folds).
 
 Sub-commands (run `python eua_pipeline.py <cmd> -h` for options):
   prepare     raw CSV -> per-second step table + ns-3 record export
@@ -23,15 +25,17 @@ Sub-commands (run `python eua_pipeline.py <cmd> -h` for options):
   train       train DL models over seeds and feature sets, save metrics/preds
   holdout     unseen-user generalisation (GroupKFold over users)
   latency     inference latency (run once on GPU and once with CPU only)
-  tune        optional Bayesian optimisation with an equal budget per model
+  tune        Bayesian optimisation with an equal budget per model (15 trials)
+  describe    architecture tables (layers, shapes, parameters) + selected hyperparameters
   report      aggregate everything into CSV / Markdown / LaTeX tables
 
 TensorFlow is imported lazily, so `prepare`, `baselines` and `report` run
-without it. Input: the Canadian and international CSV files of GAViST5G
-(see ../data/README.md).
+without it. Tested input: CombinedAggUserGeo/CombinedALLGeo.csv and
+CombinedAggUserGeo/Global/YouTubeCombinedGeo.csv.
 """
 import argparse
 import ipaddress
+import re
 import json
 import math
 import os
@@ -49,8 +53,9 @@ TCP_FAMILY = {"TCP", "TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3", "HTTP", "HTTP/JSO
               "HTTP2", "SSL", "SSLv2", "SSLv3", "OCSP", "THRIFT"}
 OTHER_FAMILY = {"ICMP", "ICMPv6", "ARP"}
 
-# Canadian portion (CombinedALLGeo.csv): users are stored in contiguous blocks per app.
-CANADA_APP_RANGES = [("Crave", 1, 10), ("LOL", 11, 19), ("Netflix", 20, 31),
+# Ottawa CombinedALLGeo.csv: users are stored in contiguous blocks per app
+# (verified against the per-app *Combined.csv files, 100% row match).
+OTTAWA_APP_RANGES = [("Crave", 1, 10), ("LOL", 11, 19), ("Netflix", 20, 31),
                      ("Prime", 32, 42), ("TFT", 43, 50), ("VAL", 51, 54),
                      ("YouTube", 55, 83)]
 APP_TYPE = {"Crave": "video", "Netflix": "video", "Prime": "video", "YouTube": "video",
@@ -66,6 +71,7 @@ FEATURE_SETS = {
     "no_rtt": ([c for c in NUM_BASE if c != "artt"] + NUM_SRV, True),
     "no_srv": ([c for c in NUM_BASE], False),       # no server history at all
 }
+CODE_VERSION = "SS5G v3.0 (JCC revision 2)"
 ALL_MODELS = ["DNN", "LSTM", "GRU", "Transformer", "Autoformer", "TFT", "FEDformer"]
 PAD, UNK = 0, 1
 
@@ -134,12 +140,12 @@ def assign_apps(users, data_path, single_app=None, app_map=None):
         return {u: single_app for u in users}
     if "CombinedALLGeo" in os.path.basename(data_path):
         res = {}
-        for app, a, b in CANADA_APP_RANGES:
+        for app, a, b in OTTAWA_APP_RANGES:
             for u in range(a, b + 1):
                 res[u] = app
         missing = [u for u in users if u not in res]
         if missing:
-            raise SystemExit(f"Users {missing} not in the Canadian app map; pass --app-map")
+            raise SystemExit(f"Users {missing} not in the Ottawa app map; pass --app-map")
         return res
     raise SystemExit("Cannot infer the application per user: pass --single-app or --app-map")
 
@@ -230,14 +236,14 @@ def cmd_prepare(a):
     steps["k"] = steps.groupby("User").cumcount()
     steps.drop(columns=["b_udp", "bytes"]).to_csv(os.path.join(a.work, "steps.csv.gz"), index=False)
 
-    # ---- ns-3 export: every record, with the dominant-flow flag (input of ns3/make_ns3_inputs.py)
+    # ---- ns-3 export: every record, with the dominant-flow flag (used tomorrow)
     rec = df[["User", "t", "user_ip", "server", "dir", "transport", "Length", "app",
               "user_lat", "user_lon"]].copy()
     rec = rec.merge(dom.rename(columns={"server": "dom_server"}), on=["User", "t"], how="left")
     rec["is_dominant"] = (rec.server == rec.dom_server).astype(int)
     rec.drop(columns=["dom_server"]).to_csv(os.path.join(a.work, "ns3_records.csv.gz"), index=False)
 
-    # ---- dataset statistics
+    # ---- dataset statistics (for the paper's dataset table, R1.4 / R1.13 / R3.2)
     stats = {
         "source_file": os.path.basename(a.data), "raw_rows": int(n0), "kept_rows": int(len(df)),
         "users": int(df.User.nunique()), "servers": int(srv.shape[0]),
@@ -614,7 +620,7 @@ def build_model(name, W, F, use_srv, n_srv, n_org, n_app, n_classes, cfg=None):
         rnn = L.LSTM if name == "LSTM" else L.GRU
         h = rnn(u, activation="tanh")(x)
         h = L.Dropout(drop)(h)
-        h = L.Dense(dn, activation="tanh")(h)
+        h = L.Dense(dn, activation="tanh", kernel_regularizer=reg)(h)
     else:
         kind = {"Transformer": "transformer", "Autoformer": "autoformer",
                 "FEDformer": "fedformer", "TFT": "tft"}[name]
@@ -625,9 +631,9 @@ def build_model(name, W, F, use_srv, n_srv, n_org, n_app, n_classes, cfg=None):
         for i in range(n_blocks):
             h = EncoderBlock(kind, dm, cfg["heads"], cfg["ff"], 0.1, cfg["ma_kernel"], name=f"enc{i}")(h)
         h = L.GlobalAveragePooling1D()(h)
-        h = L.Dense(u, activation="relu")(h)
+        h = L.Dense(u, activation="relu", kernel_regularizer=reg)(h)
         h = L.Dropout(drop)(h)
-        h = L.Dense(dn, activation="relu")(h)
+        h = L.Dense(dn, activation="relu", kernel_regularizer=reg)(h)
     out = L.Dense(n_classes, activation="softmax", name="out")(h)
     model = tf.keras.Model(ins, out, name=name)
     model.compile(optimizer=tf.keras.optimizers.Adam(cfg["lr"]),
@@ -692,13 +698,50 @@ def train_one(ds, model_name, fs, seed, a, cfg=None, split_tag="chrono", save_di
 
 
 def append_row(path, row):
+    """append one result row; if the row has new columns, rewrite the file with the union of columns"""
     df = pd.DataFrame([row])
     if os.path.exists(path):
-        old = pd.read_csv(path)
-        if list(old.columns) != list(df.columns):     # rows with different metrics (e.g. baselines vs models)
-            pd.concat([old, df], ignore_index=True).to_csv(path, index=False)
-            return
+        try:
+            old = read_ragged_csv(path)
+            if not set(df.columns) <= set(old.columns):
+                pd.concat([old, df], ignore_index=True).to_csv(path, index=False)
+                return
+            df = df.reindex(columns=old.columns)
+        except Exception:
+            pass
     df.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
+
+
+TRAIN_EXTRA = ["model", "feature_set", "seed", "split", "epochs", "train_time_s", "time_per_epoch_s",
+               "params", "n_train", "n_val", "best_val_loss"]
+
+
+def read_ragged_csv(path):
+    """read a results CSV whose rows were appended with different column sets (holdout file:
+    baseline rows first, model rows with the training columns + fold afterwards)"""
+    import csv as _csv
+    with open(path, newline="") as f:
+        rows = list(_csv.reader(f))
+    hdr = rows[0]
+    base_extra = ["model", "feature_set", "seed", "fold", "split"]
+    metric_keys = [c for c in hdr if c not in base_extra and c not in TRAIN_EXTRA]
+    alt = metric_keys + TRAIN_EXTRA + ["fold"]
+    recs = []
+    for r in rows[1:]:
+        if not r:
+            continue
+        if len(r) == len(hdr):
+            recs.append(dict(zip(hdr, r)))
+        elif len(r) == len(alt):
+            recs.append(dict(zip(alt, r)))
+        else:
+            raise ValueError(f"unexpected row length {len(r)} in {path}")
+    d = pd.DataFrame(recs)
+    for c in d.columns:
+        conv = pd.to_numeric(d[c], errors="coerce")
+        if conv.notna().sum() == d[c].replace("", np.nan).notna().sum():
+            d[c] = conv
+    return d
 
 
 def done_set(path):
@@ -710,7 +753,8 @@ def done_set(path):
 
 def load_cfg(a, model_name):
     if getattr(a, "use_tuned", False):
-        p = os.path.join(a.out, "tuning", f"{model_name}.json")
+        tdir = getattr(a, "tuning_dir", None) or os.path.join(a.out, "tuning")
+        p = os.path.join(tdir, f"{model_name}.json")
         if os.path.exists(p):
             return json.load(open(p))["best"]
         log(f"WARNING: no tuned config for {model_name}; using defaults")
@@ -797,7 +841,7 @@ def cmd_holdout(a):
         if a.models:
             for mname in a.models:
                 for fs in a.feature_sets:
-                    m, *_ = train_one(ds, mname, fs, a.seed, a, split_tag="unseen_users")
+                    m, *_ = train_one(ds, mname, fs, a.seed, a, load_cfg(a, mname), split_tag="unseen_users")
                     m["fold"] = fi
                     append_row(path, m)
                     log(f"    {mname}/{fs} fold {fi}: acc={m['acc']:.4f} unseen_label_rate={m['unseen_label_rate']:.3f}")
@@ -856,6 +900,18 @@ def cmd_latency(a):
 # --------------------------------------------------------------------------
 # 8. OPTIONAL TUNING (equal budget for every model)
 # --------------------------------------------------------------------------
+def tune_space(hp, mname):
+    """Search space of the equal-budget tuning. Only hyperparameters that exist in a model are tuned."""
+    cfg = {"lr": hp.Float("lr", 1e-4, 3e-3, sampling="log"),
+           "l2": hp.Choice("l2", [0.0, 1e-5, 1e-4, 1e-3]),
+           "units": hp.Choice("units", [32, 64, 128])}
+    if mname != "DNN":                                    # the DNN has no dropout layer
+        cfg["dropout"] = hp.Float("dropout", 0.0, 0.5, step=0.1)
+    if mname not in ("DNN", "LSTM", "GRU"):
+        cfg["d_model"] = hp.Choice("d_model", [32, 64])
+    return cfg
+
+
 def cmd_tune(a):
     try:
         import keras_tuner as kt
@@ -868,31 +924,94 @@ def cmd_tune(a):
     os.makedirs(os.path.join(a.out, "tuning"), exist_ok=True)
     models = ALL_MODELS if a.models == ["all"] else a.models
     for mname in models:
-        def hb(hp):
-            cfg = {"lr": hp.Float("lr", 1e-4, 3e-3, sampling="log"),
-                   "dropout": hp.Float("dropout", 0.0, 0.5, step=0.1),
-                   "units": hp.Choice("units", [32, 64, 128]),
-                   "l2": hp.Choice("l2", [0.0, 1e-5, 1e-4, 1e-3])}
-            if mname not in ("DNN", "LSTM", "GRU"):
-                cfg["d_model"] = hp.Choice("d_model", [32, 64])
+        jp = os.path.join(a.out, "tuning", f"{mname}.json")
+        if os.path.exists(jp):
+            log(f"skip tuning {mname} (already in {jp})")
+            continue
+        log(f"=== tuning {mname}: {a.trials} trials, <= {a.epochs} epochs each")
+        t0 = time.time()
+
+        def hb(hp, mname=mname):
             model, _ = build_model(mname, ds.W, xtr["num"].shape[2], True, ds.n_srv, ds.n_org,
-                                   ds.n_app, ds.n_classes(), cfg)
+                                   ds.n_app, ds.n_classes(), tune_space(hp, mname))
             return model
         m0, names = build_model(mname, ds.W, xtr["num"].shape[2], True, ds.n_srv, ds.n_org, ds.n_app, ds.n_classes())
+        del m0
         tf.keras.backend.clear_session()
+        # KerasTuner's checkpoint paths are long; keep its working folder short and outside Dropbox
+        # (Windows 260-character path limit). Only the summary <model>.json goes to results/tuning.
+        kt_dir = a.kt_dir or os.environ.get("KT_DIR") or os.path.join(os.path.expanduser("~"), "kt_jcc_r2")
         tuner = kt.BayesianOptimization(hb, objective="val_loss", max_trials=a.trials, seed=0,
-                                        directory=os.path.join(a.out, "tuning", "kt"), project_name=mname,
-                                        overwrite=False)
+                                        directory=kt_dir, project_name=mname,
+                                        overwrite=False)            # resumes after an interruption
         tuner.search(as_list(xtr, names), ytr, validation_data=(as_list(xva, names), yva),
                      epochs=a.epochs, batch_size=a.batch,
-                     callbacks=[tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=3)], verbose=0)
+                     callbacks=[tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=3,
+                                                                 restore_best_weights=True)], verbose=0)
         best = tuner.get_best_hyperparameters(1)[0].values
         trials = [{"trial": t.trial_id, **t.hyperparameters.values, "val_loss": t.score}
                   for t in tuner.oracle.trials.values()]
-        json.dump({"best": best, "trials": trials, "budget": {"trials": a.trials, "epochs": a.epochs}},
-                  open(os.path.join(a.out, "tuning", f"{mname}.json"), "w"), indent=2)
-        log(mname, "best", best)
+        json.dump({"best": best, "trials": trials, "budget": {"trials": a.trials, "epochs": a.epochs, "patience": 3},
+                   "tuning_time_s": round(time.time() - t0, 1), "code_version": CODE_VERSION,
+                   "keras_tuner_dir": os.path.join(kt_dir, mname)},
+                  open(jp, "w"), indent=2)
+        log(mname, "best", best, f"({(time.time() - t0) / 60:.1f} min)")
         tf.keras.backend.clear_session()
+
+
+# --------------------------------------------------------------------------
+# 8b. ARCHITECTURE DESCRIPTION (tables generated from the code)
+# --------------------------------------------------------------------------
+MECHANISMS = {
+    "DNN": "three fully connected layers on the last time step",
+    "LSTM": "one LSTM layer over the window",
+    "GRU": "one GRU layer over the window",
+    "Transformer": "encoder: multi-head self-attention + feed-forward, sinusoidal positional encoding",
+    "Autoformer": "encoder with series decomposition (moving average) into trend and seasonal parts; "
+                  "multi-head self-attention on the seasonal part",
+    "FEDformer": "encoder with series decomposition (moving average); attention on the Fourier "
+                 "representation (FFT over time) of the seasonal part",
+    "TFT": "encoder with sigmoid input gating before multi-head self-attention, sinusoidal positional encoding",
+}
+
+
+def cmd_describe(a):
+    """Write results/architectures.{md,json}: every model's layers, output shapes, parameter counts
+    and the hyperparameters actually used (tuned values if --use-tuned)."""
+    tf = setup_tf(0)
+    import platform
+    ds = Dataset(a.work, W=a.window, max_users=a.max_users)
+    x, _, _ = ds.windows("test", "full")
+    models = ALL_MODELS if a.models == ["all"] else a.models
+    allj, md = {}, [f"# Model architectures ({CODE_VERSION})", "",
+                    f"TensorFlow {tf.__version__}, Python {platform.python_version()}, window W={ds.W}, "
+                    f"{x['num'].shape[2]} numeric features, {ds.n_classes()} output classes.", ""]
+    for mname in models:
+        cfg = {**DEFAULT_CFG, **(load_cfg(a, mname) or {})}
+        model, _ = build_model(mname, ds.W, x["num"].shape[2], True, ds.n_srv, ds.n_org,
+                               ds.n_app, ds.n_classes(), cfg)
+        layers = []
+        for ly in model.layers:
+            try:
+                shp = str(ly.output_shape)
+            except Exception:
+                shp = "?"
+            layers.append({"name": ly.name, "type": type(ly).__name__, "output": shp,
+                           "params": int(ly.count_params())})
+        allj[mname] = {"hyperparameters": cfg, "mechanism": MECHANISMS.get(mname, ""),
+                       "params": int(model.count_params()), "layers": layers}
+        md += [f"## {mname}", "", f"Mechanism: {MECHANISMS.get(mname, '')}", "",
+               "Hyperparameters: " + ", ".join(f"{k}={v}" for k, v in cfg.items()), "",
+               f"Parameters: {model.count_params():,}", "", "| Layer | Type | Output shape | Params |",
+               "|---|---|---|---|"]
+        md += [f"| {l['name']} | {l['type']} | {l['output']} | {l['params']:,} |" for l in layers]
+        md.append("")
+        tf.keras.backend.clear_session()
+    os.makedirs(a.out, exist_ok=True)
+    tag = "-".join(models)
+    json.dump(allj, open(os.path.join(a.out, f"architectures_{tag}.json"), "w"), indent=2, default=str)
+    open(os.path.join(a.out, f"architectures_{tag}.md"), "w", encoding="utf-8").write("\n".join(md))
+    log("wrote", os.path.join(a.out, f"architectures_{tag}.md"))
 
 
 # --------------------------------------------------------------------------
@@ -967,6 +1086,26 @@ def cmd_report(a):
                 tests.append({"file": f, "acc": ok.mean(), "persistence_acc": b_ok.mean(),
                               "model_only_correct": b, "persistence_only_correct": c, "mcnemar_p": pval})
         pd.DataFrame(tests).to_csv(os.path.join(out, "mcnemar_vs_persistence.csv"), index=False)
+        # paired differences on identical test samples: model(seed) - persistence, 95% t-CI over seeds
+        prs = []
+        for f in sorted(os.listdir(pdir)):
+            mm = re.match(r"pred_(.+?)_full_seed(\d+)\.csv\.gz$", f)
+            if not mm:
+                continue
+            q = pd.read_csv(os.path.join(pdir, f))
+            if len(q) != len(base):
+                continue
+            ok = (q.pred_server == q.label_server).values
+            prs.append({"model": mm.group(1), "seed": int(mm.group(2)),
+                        "d_acc": ok.mean() - b_ok.mean()})
+        if prs:
+            pr = pd.DataFrame(prs)
+            agg = []
+            for mname, g in pr.groupby("model", sort=False):
+                mu, sd, h = mean_ci(g.d_acc)
+                agg.append({"model": mname, "n_seeds": len(g), "d_acc_mean": mu, "d_acc_sd": sd,
+                            "d_acc_ci95_lo": mu - h, "d_acc_ci95_hi": mu + h})
+            pd.DataFrame(agg).to_csv(os.path.join(out, "paired_vs_persistence.csv"), index=False)
 
     # Markdown + LaTeX main table (full feature set + baselines)
     main = summ[summ.feature_set.isin(["full", "-"])]
@@ -1001,7 +1140,7 @@ def cmd_report(a):
         md.append(f"| {mname} | " + " | ".join(cells) + " |")
     hp = os.path.join(out, "metrics_holdout.csv")
     if os.path.exists(hp):
-        h = pd.read_csv(hp)
+        h = read_ragged_csv(hp)
         md += ["", "### Unseen users (5 user-disjoint folds, mean ± sd over folds)", "",
                "| Model | Acc. % | Acc. on changes % | Unseen-label rate % |", "|---|---|---|---|"]
         for (mname, fs), g in h.groupby(["model", "feature_set"], sort=False):
@@ -1042,11 +1181,12 @@ def main():
         sp.add_argument("--patience", type=int, default=5)
         sp.add_argument("--verbose", action="store_true")
         sp.add_argument("--use-tuned", action="store_true", help="use results/tuning/<model>.json")
+        sp.add_argument("--tuning-dir", default=None, help="folder with <model>.json (default: <out>/tuning)")
 
     sp = sub.add_parser("prepare")
-    sp.add_argument("--data", required=True, help="GAViST5G CSV: CombinedALLGeo.csv (Canadian) or YouTubeCombinedGeo.csv (international, with --single-app YouTube)")
+    sp.add_argument("--data", required=True, help="CombinedALLGeo.csv (or Global/YouTubeCombinedGeo.csv)")
     sp.add_argument("--work", default="work")
-    sp.add_argument("--single-app", default=None, help="e.g. YouTube for the international file")
+    sp.add_argument("--single-app", default=None, help="e.g. YouTube for the Global file")
     sp.add_argument("--app-map", default=None, help="CSV with columns User,app")
     sp.add_argument("--session-gap", type=int, default=300)
 
@@ -1079,12 +1219,20 @@ def main():
     sp.add_argument("--runs", type=int, default=300)
     sp.add_argument("--batch-size", type=int, default=256)
     sp.add_argument("--use-tuned", action="store_true")
+    sp.add_argument("--tuning-dir", default=None)
 
     sp = sub.add_parser("tune")
     common(sp)
     trainargs(sp)
     sp.add_argument("--models", nargs="+", default=["all"])
     sp.add_argument("--trials", type=int, default=15)
+    sp.add_argument("--kt-dir", default=None, help="KerasTuner working folder (default ~/kt_jcc_r2)")
+
+    sp = sub.add_parser("describe")
+    common(sp)
+    sp.add_argument("--models", nargs="+", default=["all"])
+    sp.add_argument("--use-tuned", action="store_true")
+    sp.add_argument("--tuning-dir", default=None)
 
     sp = sub.add_parser("report")
     sp.add_argument("--out", default="results")
@@ -1093,7 +1241,7 @@ def main():
     if a.cmd == "tune":
         a.epochs = min(a.epochs, 15)
     {"prepare": cmd_prepare, "baselines": cmd_baselines, "smoke": cmd_smoke, "train": cmd_train, "holdout": cmd_holdout,
-     "latency": cmd_latency, "tune": cmd_tune, "report": cmd_report}[a.cmd](a)
+     "latency": cmd_latency, "tune": cmd_tune, "describe": cmd_describe, "report": cmd_report}[a.cmd](a)
 
 
 if __name__ == "__main__":
